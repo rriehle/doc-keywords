@@ -370,12 +370,9 @@ To modify:
 
 ## License
 
-[Specify your license here]
+MIT
 
 ## Contributing
 
-[Specify contribution guidelines here]
+Will review Pull Requests
 
-## Credits
-
-Extracted and generalized from the Provenance Pipeline documentation tooling.
