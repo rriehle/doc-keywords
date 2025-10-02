@@ -1,0 +1,386 @@
+#!/usr/bin/env bb
+
+(ns doc-keywords
+  "Documentation keyword extraction and analysis tool.
+   Supports keyword indexing, validation, graphing, and statistics for Markdown documentation."
+  (:require [babashka.fs :as fs]
+            [clojure.edn :as edn]
+            [clojure.string :as str]
+            [clojure.java.io :as io]
+            [cheshire.core :as json]))
+
+;; ============================================================================
+;; Configuration and Project Discovery
+;; ============================================================================
+
+(def default-config
+  "Default configuration values"
+  {:doc-dir "doc"
+   :taxonomy "doc-tools/keyword-taxonomy.md"})
+
+(defn find-git-root
+  "Find git root by searching upward from start-path.
+   Returns nil if not in a git repository."
+  [start-path]
+  (loop [current (fs/absolutize start-path)]
+    (cond
+      (fs/exists? (fs/path current ".git"))
+      (str current)
+
+      (nil? current)
+      nil
+
+      :else
+      (let [parent (fs/parent current)]
+        (if (or (nil? parent) (= (str current) (str parent)))
+          nil
+          (recur parent))))))
+
+(defn discover-project-root
+  "Discover project root starting from current directory.
+   Tries git root first, falls back to current directory."
+  []
+  (or (find-git-root (fs/cwd))
+      (str (fs/cwd))))
+
+(defn load-config
+  "Load configuration from optional .doc-keywords.edn in project root.
+   Merges with default config."
+  [project-root]
+  (let [config-file (fs/path project-root ".doc-keywords.edn")]
+    (if (fs/exists? config-file)
+      (merge default-config (edn/read-string (slurp (str config-file))))
+      default-config)))
+
+(defn resolve-path
+  "Resolve a path relative to project root, returning absolute path."
+  [project-root relative-path]
+  (str (fs/absolutize (fs/path project-root relative-path))))
+
+(defn resolve-projects
+  "Resolve list of project roots from args.
+   If args empty, uses current project. Otherwise treats each arg as project root."
+  [args]
+  (if (empty? args)
+    [(discover-project-root)]
+    (map #(str (fs/absolutize %)) args)))
+
+(defn load-project-context
+  "Load project context (root, config, doc-dir) for a project root."
+  [project-root]
+  (let [config (load-config project-root)
+        doc-dir (resolve-path project-root (:doc-dir config))
+        taxonomy (resolve-path project-root (:taxonomy config))]
+    {:root project-root
+     :config config
+     :doc-dir doc-dir
+     :taxonomy taxonomy}))
+
+;; ============================================================================
+;; Keyword Extraction
+;; ============================================================================
+
+(defn extract-keywords-from-content
+  "Extract keywords from markdown content.
+   Returns set of keywords found in content."
+  [content]
+  (->> (re-seq #"\[:([^\]]+)\]" content)
+       (map second)
+       (mapcat #(str/split % #"\s+"))
+       (map (fn [s] (str/replace s ":" "")))
+       (filter seq)
+       (map keyword)
+       distinct
+       set))
+
+(defn extract-keywords-from-file
+  "Extract keywords from a markdown file.
+   Returns vector of [file-path keyword-set]."
+  [file-path]
+  (try
+    (let [content (slurp file-path)
+          keywords (extract-keywords-from-content content)]
+      [file-path keywords])
+    (catch Exception e
+      (println "Error reading" file-path ":" (.getMessage e))
+      [file-path #{}])))
+
+;; ============================================================================
+;; File Discovery
+;; ============================================================================
+
+(defn find-markdown-files
+  "Find all markdown files in a directory tree."
+  [dir]
+  (filter #(str/ends-with? (str %) ".md")
+          (map str (file-seq (io/file dir)))))
+
+;; ============================================================================
+;; Commands
+;; ============================================================================
+
+(defn cmd-extract-keywords
+  "Extract keywords from a specific markdown file."
+  [args]
+  (when (empty? args)
+    (println "Usage: doc-keywords extract-keywords <file>")
+    (System/exit 1))
+  (let [file (first args)
+        content (slurp file)
+        keywords (->> (re-seq #"\[:([^\]]+)\]" content)
+                      (map second)
+                      (mapcat #(str/split % #"\s+"))
+                      (map (fn [s] (str/replace s ":" "")))
+                      (filter seq)
+                      (map keyword)
+                      distinct
+                      sort)]
+    (doseq [k keywords]
+      (println k))))
+
+(defn cmd-keyword-index
+  "Build keyword index for all markdown files in doc directory."
+  [args]
+  (let [projects (resolve-projects args)
+        contexts (map load-project-context projects)
+        extract-keywords (fn [file]
+                          (->> (slurp file)
+                               (re-seq #"\[:([^\]]+)\]")
+                               (map second)
+                               (mapcat #(str/split % #"\s+"))
+                               (map (fn [s] (str/replace s ":" "")))
+                               (filter seq)
+                               (map keyword)
+                               distinct))
+        index (reduce (fn [idx ctx]
+                        (let [doc-dir (:doc-dir ctx)
+                              project-name (fs/file-name (:root ctx))
+                              files (find-markdown-files doc-dir)]
+                          (reduce (fn [idx file]
+                                    (let [keywords (extract-keywords file)
+                                          rel-path (str/replace file (str doc-dir "/") "")
+                                          file-ref (if (> (count projects) 1)
+                                                    (str project-name "/" rel-path)
+                                                    rel-path)]
+                                      (reduce (fn [idx kw]
+                                                (update idx kw (fnil conj #{}) file-ref))
+                                              idx
+                                              keywords)))
+                                  idx
+                                  files)))
+                      {}
+                      contexts)]
+    (println (json/generate-string index {:pretty true}))))
+
+(defn cmd-keyword-graph
+  "Generate keyword relationship graph in DOT format."
+  [args]
+  (let [projects (resolve-projects args)
+        contexts (map load-project-context projects)
+        extract-keyword-sets (fn [file]
+                              (->> (slurp file)
+                                   (re-seq #"\[:[^\]]+\]")
+                                   (map #(str/replace % #"[\[\]]" ""))
+                                   (map (fn [s] (->> (str/split s #"\s+")
+                                                     (map str/trim)
+                                                     (filter #(str/starts-with? % ":"))
+                                                     (map #(str/replace % ":" ""))
+                                                     (map keyword)
+                                                     set)))
+                                   (filter #(> (count %) 1))))
+        relationships (mapcat (fn [ctx]
+                               (let [files (find-markdown-files (:doc-dir ctx))]
+                                 (mapcat extract-keyword-sets files)))
+                             contexts)
+        edges (distinct
+               (for [kw-set relationships
+                     kw1 kw-set
+                     kw2 kw-set
+                     :when (not= kw1 kw2)]
+                 [kw1 kw2]))]
+    (println "digraph KeywordRelationships {")
+    (println "  rankdir=LR;")
+    (println "  node [shape=box, style=rounded];")
+    (doseq [[k1 k2] edges]
+      (println (format "  \"%s\" -> \"%s\";" (name k1) (name k2))))
+    (println "}")))
+
+(defn cmd-validate-keywords
+  "Validate keywords against taxonomy."
+  [args]
+  (let [projects (resolve-projects args)
+        contexts (map load-project-context projects)
+        all-valid? (atom true)]
+    (doseq [ctx contexts]
+      (let [taxonomy-file (:taxonomy ctx)
+            doc-dir (:doc-dir ctx)
+            project-name (fs/file-name (:root ctx))]
+        (when (> (count projects) 1)
+          (println "\n======================")
+          (println "Project:" project-name)
+          (println "======================"))
+        (if-not (fs/exists? taxonomy-file)
+          (do
+            (println "⚠ Warning: Taxonomy file not found:" taxonomy-file)
+            (println "Skipping validation for this project"))
+          (let [valid-keywords (->> (slurp taxonomy-file)
+                                    (re-seq #"`:([^`]+)`")
+                                    (map second)
+                                    (map keyword)
+                                    set)
+                files (find-markdown-files doc-dir)
+                extract-keywords (fn [file]
+                                  (->> (slurp file)
+                                       (re-seq #"\[:([^\]]+)\]")
+                                       (map second)
+                                       (mapcat #(str/split % #"\s+"))
+                                       (map (fn [s] (str/replace s ":" "")))
+                                       (filter seq)
+                                       (map keyword)))
+                issues (reduce (fn [acc file]
+                                (let [keywords (extract-keywords file)
+                                      invalid (remove valid-keywords keywords)]
+                                  (if (seq invalid)
+                                    (conj acc {:file (str/replace file (str doc-dir "/") "")
+                                              :invalid invalid})
+                                    acc)))
+                              []
+                              files)]
+            (if (empty? issues)
+              (println "✓ All keywords valid")
+              (do
+                (reset! all-valid? false)
+                (println "❌ Invalid keywords found:")
+                (doseq [{:keys [file invalid]} issues]
+                  (println (str "\n" file ":"))
+                  (doseq [kw invalid]
+                    (println (str "  - :" (name kw)))))))))))
+    (System/exit (if @all-valid? 0 1))))
+
+(defn cmd-suggest-keywords
+  "Suggest keywords for a file based on content."
+  [args]
+  (when (empty? args)
+    (println "Usage: doc-keywords suggest-keywords <file>")
+    (System/exit 1))
+  (let [file (first args)
+        content (slurp file)
+        suggestions (cond-> []
+                      (re-find #"(?i)architecture|design pattern" content)
+                      (conj :architecture)
+
+                      (re-find #"(?i)security|threat|vulnerability" content)
+                      (conj :security)
+
+                      (re-find #"(?i)authentication|auth" content)
+                      (conj :authentication)
+
+                      (re-find #"(?i)performance|latency|throughput" content)
+                      (conj :performance)
+
+                      (re-find #"(?i)scale|scaling|distributed" content)
+                      (conj :scalability)
+
+                      (re-find #"(?i)api|rest|endpoint" content)
+                      (conj :api)
+
+                      (re-find #"(?i)database|sql|query" content)
+                      (conj :database)
+
+                      (re-find #"(?i)test|testing|coverage" content)
+                      (conj :testability))]
+    (if (seq suggestions)
+      (do
+        (println "Suggested keywords based on content:")
+        (doseq [kw suggestions]
+          (println (str "  :" (name kw)))))
+      (println "No keyword suggestions found"))))
+
+(defn cmd-keyword-stats
+  "Show keyword usage statistics."
+  [args]
+  (let [projects (resolve-projects args)
+        contexts (map load-project-context projects)
+        extract-keywords (fn [file]
+                          (->> (slurp file)
+                               (re-seq #"\[:([^\]]+)\]")
+                               (map second)
+                               (mapcat #(str/split % #"\s+"))
+                               (map (fn [s] (str/replace s ":" "")))
+                               (filter seq)
+                               (map keyword)))
+        all-keywords (mapcat (fn [ctx]
+                               (let [files (find-markdown-files (:doc-dir ctx))]
+                                 (mapcat extract-keywords files)))
+                             contexts)
+        stats (frequencies all-keywords)
+        sorted-stats (sort-by val > stats)]
+    (println "Keyword usage statistics:")
+    (println "========================")
+    (when (> (count projects) 1)
+      (println "Projects analyzed:" (count projects))
+      (println))
+    (doseq [[kw count] sorted-stats]
+      (println (format "%-20s %3d" (str ":" (name kw)) count)))
+    (println "\nTotal unique keywords:" (count stats))
+    (println "Total usages:" (reduce + (vals stats)))))
+
+(defn cmd-help
+  "Show help message."
+  [args]
+  (println "doc-keywords - Documentation keyword analysis tool")
+  (println)
+  (println "Usage: doc-keywords <command> [args]")
+  (println)
+  (println "Commands:")
+  (println "  extract-keywords <file>         Extract keywords from a specific file")
+  (println "  keyword-index [project ...]     Build keyword index (JSON)")
+  (println "  keyword-graph [project ...]     Generate DOT graph of keyword relationships")
+  (println "  validate-keywords [project ...] Validate keywords against taxonomy")
+  (println "  suggest-keywords <file>         Suggest keywords based on content")
+  (println "  keyword-stats [project ...]     Show keyword usage statistics")
+  (println "  help                            Show this help message")
+  (println)
+  (println "Arguments:")
+  (println "  <file>     - Path to a markdown file")
+  (println "  [project]  - Optional project root directory (default: current project)")
+  (println "               Multiple projects can be specified for cross-project analysis")
+  (println)
+  (println "Examples:")
+  (println "  doc-keywords validate-keywords              # Validate current project")
+  (println "  doc-keywords validate-keywords ~/proj1      # Validate specific project")
+  (println "  doc-keywords keyword-stats ~/p1 ~/p2 ~/p3  # Stats across 3 projects")
+  (println)
+  (println "Configuration:")
+  (println "  Create .doc-keywords.edn in project root to customize:")
+  (println "  {:doc-dir \"doc\"")
+  (println "   :taxonomy \"doc-tools/keyword-taxonomy.md\"}")
+  (println)
+  (println "Defaults:")
+  (println "  doc-dir: doc/")
+  (println "  taxonomy: doc-tools/keyword-taxonomy.md"))
+
+;; ============================================================================
+;; Main Entry Point
+;; ============================================================================
+
+(defn -main [& args]
+  (let [command (first args)
+        command-args (rest args)]
+    (case command
+      "extract-keywords" (cmd-extract-keywords command-args)
+      "keyword-index" (cmd-keyword-index command-args)
+      "keyword-graph" (cmd-keyword-graph command-args)
+      "validate-keywords" (cmd-validate-keywords command-args)
+      "suggest-keywords" (cmd-suggest-keywords command-args)
+      "keyword-stats" (cmd-keyword-stats command-args)
+      "help" (cmd-help command-args)
+      nil (cmd-help command-args)
+      (do
+        (println "Unknown command:" command)
+        (println)
+        (cmd-help command-args)
+        (System/exit 1)))))
+
+;; Run main
+(apply -main *command-line-args*)
