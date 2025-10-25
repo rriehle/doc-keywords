@@ -2,6 +2,10 @@
 
 A standalone Babashka tool for extracting, analyzing, and validating keywords in Markdown documentation. Supports keyword indexing, relationship graphing, validation against taxonomy, and cross-project analysis.
 
+## Deprecation Notice
+
+This repo has been deprecated in favor of the .doc utilities, which splits out functionality into multiple scripts which each "do one thing, and do it well."
+
 ## Features
 
 - **Extract keywords** from individual Markdown files
